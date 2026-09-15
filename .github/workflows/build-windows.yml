@@ -1,0 +1,67 @@
+name: Build CEFT Recon Windows
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout destination repository
+        uses: actions/checkout@v4
+
+      - name: Checkout CEFT Recon source
+        uses: actions/checkout@v4
+        with:
+          repository: Prshd/Claude
+          ref: claude/server-reconciliation-issues-69i0zn
+          path: recon-src
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.25.x'
+          cache-dependency-path: recon-src/src/go.sum
+
+      - name: Verify source
+        shell: pwsh
+        run: |
+          if (!(Test-Path recon-src/src/main.go)) { throw 'CEFT Recon source missing main.go' }
+          if (!(Test-Path recon-src/src/static/index.html)) { throw 'CEFT Recon frontend missing index.html' }
+          if (!(Test-Path recon-src/src/go.mod)) { throw 'CEFT Recon go.mod missing' }
+
+      - name: Test
+        working-directory: recon-src/src
+        run: go test ./...
+
+      - name: Build Windows executable
+        working-directory: recon-src/src
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path ../../dist | Out-Null
+          $env:GOOS='windows'
+          $env:GOARCH='amd64'
+          go build -trimpath -ldflags='-s -w' -o ../../dist/ceft-recon.exe .
+
+      - name: Package
+        shell: pwsh
+        run: |
+          Copy-Item recon-src/README.md dist/README.md -ErrorAction SilentlyContinue
+          @'
+@echo off
+cd /d "%~dp0"
+start "CEFT Recon" "%~dp0ceft-recon.exe"
+'@ | Set-Content dist/start-ceft-recon.bat -Encoding ASCII
+          Compress-Archive -Path dist/* -DestinationPath ceft-recon-windows-amd64.zip -Force
+
+      - name: Upload Windows build
+        uses: actions/upload-artifact@v4
+        with:
+          name: ceft-recon-windows-amd64
+          path: ceft-recon-windows-amd64.zip
+          if-no-files-found: error
