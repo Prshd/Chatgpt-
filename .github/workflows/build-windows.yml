@@ -1,8 +1,9 @@
-name: Build CEFT Recon Windows
+name: Build Smart Reconciliation Windows
 
 on:
   push:
     branches:
+      - reconciliation-rebuild
       - main
   workflow_dispatch:
 
@@ -13,59 +14,56 @@ jobs:
   build:
     runs-on: windows-latest
     steps:
-      - name: Checkout destination repository
+      - name: Checkout Smart Reconciliation
         uses: actions/checkout@v4
-
-      - name: Checkout CEFT Recon source
-        uses: actions/checkout@v4
-        with:
-          repository: Prshd/Claude
-          ref: claude/server-reconciliation-issues-69i0zn
-          path: recon-src
 
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
           go-version: '1.25.x'
-          cache-dependency-path: recon-src/src/go.sum
+          cache: true
 
-      - name: Verify source
+      - name: Verify project
         shell: pwsh
         run: |
-          if (!(Test-Path 'recon-src/src/main.go')) { throw 'CEFT Recon source missing main.go' }
-          if (!(Test-Path 'recon-src/src/static/index.html')) { throw 'CEFT Recon frontend missing index.html' }
-          if (!(Test-Path 'recon-src/src/go.mod')) { throw 'CEFT Recon go.mod missing' }
+          if (!(Test-Path 'go.mod')) { throw 'go.mod missing' }
+          if (!(Test-Path 'main.go')) { throw 'main.go missing' }
+          if (!(Test-Path 'static/index.html')) { throw 'static/index.html missing' }
 
       - name: Test
-        working-directory: recon-src/src
         shell: pwsh
         run: go test ./...
 
-      - name: Build Windows executable
-        working-directory: recon-src/src
+      - name: Build Version 100
         shell: pwsh
         run: |
-          New-Item -ItemType Directory -Force -Path '../../dist' | Out-Null
+          New-Item -ItemType Directory -Force -Path 'dist' | Out-Null
           $env:GOOS = 'windows'
           $env:GOARCH = 'amd64'
-          go build -trimpath -ldflags '-s -w' -o '../../dist/ceft-recon.exe' .
+          go build -trimpath -ldflags '-s -w' -o 'dist/SmartReconciliation.exe' .
+          if (!(Test-Path 'dist/SmartReconciliation.exe')) { throw 'Build failed' }
 
       - name: Package
         shell: pwsh
         run: |
-          if (Test-Path 'recon-src/README.md') {
-            Copy-Item 'recon-src/README.md' 'dist/README.md' -Force
-          }
           @(
             '@echo off'
             'cd /d "%~dp0"'
-            'start "CEFT Recon" "%~dp0ceft-recon.exe"'
-          ) | Set-Content 'dist/start-ceft-recon.bat' -Encoding ASCII
-          Compress-Archive -Path 'dist/*' -DestinationPath 'ceft-recon-windows-amd64.zip' -Force
+            'start "Smart Reconciliation" "%~dp0SmartReconciliation.exe"'
+          ) | Set-Content 'dist/start-smart-reconciliation.bat' -Encoding ASCII
+          @(
+            'Smart Reconciliation - Version 100'
+            ''
+            'Windows x64 standalone build.'
+            'Persistent SQLite database is stored in the Windows user config directory.'
+            ''
+            'Run start-smart-reconciliation.bat or SmartReconciliation.exe.'
+          ) | Set-Content 'dist/README.txt' -Encoding UTF8
+          Compress-Archive -Path 'dist/*' -DestinationPath 'SmartReconciliation-v100-windows-amd64.zip' -Force
 
-      - name: Upload Windows build
+      - name: Upload Version 100
         uses: actions/upload-artifact@v4
         with:
-          name: ceft-recon-windows-amd64
-          path: ceft-recon-windows-amd64.zip
+          name: SmartReconciliation-v100-windows-amd64
+          path: SmartReconciliation-v100-windows-amd64.zip
           if-no-files-found: error
