@@ -36,6 +36,19 @@ jobs:
           if (!(Test-Path 'recon-src/src/static/index.html')) { throw 'CEFT Recon frontend missing index.html' }
           if (!(Test-Path 'recon-src/src/go.mod')) { throw 'CEFT Recon go.mod missing' }
 
+      - name: Apply robust visible 4-stage UI patch
+        shell: pwsh
+        run: ./build/patch-visible-4stage.ps1
+
+      - name: Verify 4-stage UI patch
+        shell: pwsh
+        run: |
+          $p = Get-Content -Raw -Encoding UTF8 'recon-src/src/static/index.html'
+          if (!$p.Contains('CEFT_RECON_VISIBLE_4STAGE_PATCH_V1')) { throw '4-stage patch marker missing' }
+          if (!$p.Contains('v4-ceft-1')) { throw 'CEFT 4-stage controls missing' }
+          if (!$p.Contains('v4-banker-4')) { throw 'Banker 4-stage controls missing' }
+          if (!$p.Contains('window.__ceftVisible4Stage')) { throw '4-stage action bridge missing' }
+
       - name: Test
         working-directory: recon-src/src
         shell: pwsh
