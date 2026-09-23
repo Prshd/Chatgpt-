@@ -206,4 +206,44 @@ func (a *App) importProgress(w http.ResponseWriter,r *http.Request){
     send()
     for {select{case <-r.Context().Done():return;case <-ticker.C:send();snap:=jobSnapshot(j);if snap["status"]=="done"||snap["status"]=="error"||snap["status"]=="cancelled"{return}}}
 }
+func (a *App) importReaderWithProgress(f io.Reader, name, kind string, progress func(int64,int64))(int64,int64,error){
+    a.heavy.Lock(); defer a.heavy.Unlock()
+    res,err:=a.db.Exec("INSERT INTO datasets(name,kind,rows,created_at) VALUES(?,?,0,?)",name,kind,time.Now().UTC().Format(time.RFC3339));if err!=nil{return 0,0,err}
+    ds,err:=res.LastInsertId();if err!=nil{return 0,0,err}
+    const batchSize int64=50000
+    var tx *sql.Tx
+    var insert *sql.Stmt
+    var count int64
+    beginBatch:=func() error{var e error;tx,e=a.db.Begin();if e!=nil{return e};insert,e=tx.Prepare("INSERT INTO transactions(dataset_id,business_date,rrn,reference,amount_cents,raw_json) VALUES(?,?,?,?,?,?)");if e!=nil{_ = tx.Rollback();return e};return nil}
+    commitBatch:=func() error{if insert!=nil{_ = insert.Close()};insert=nil;if tx!=nil{if e:=tx.Commit();e!=nil{return e}};tx=nil;_,e:=a.db.Exec("UPDATE datasets SET rows=? WHERE id=?",count,ds);return e}
+    if err=beginBatch();err!=nil{return ds,count,err}
+    fail:=func(e error)(int64,int64,error){if insert!=nil{_ = insert.Close()};if tx!=nil{_ = tx.Rollback()};return ds,count,e}
+    add:=func(x record) error{
+        if _,e:=insert.Exec(ds,normalizeDate(x.Date),clean(x.RRN),clean(x.Ref),x.Amount,x.Raw);e!=nil{return e}
+        count++
+        if count%batchSize==0{if e:=commitBatch();e!=nil{return e};if progress!=nil{progress(count,0)};if e:=beginBatch();e!=nil{return e}}
+        return nil
+    }
+    ext:=strings.ToLower(filepath.Ext(name))
+    switch ext{
+    case ".xlsx",".xlsm":
+        tmp,err:=os.CreateTemp("","recon-*.xlsx");if err!=nil{return fail(err)};tmpPath:=tmp.Name();defer os.Remove(tmpPath)
+        if _,err=io.Copy(tmp,f);err!=nil{tmp.Close();return fail(err)};if err=tmp.Close();err!=nil{return fail(err)}
+        book,err:=excelize.OpenFile(tmpPath);if err!=nil{return fail(err)};defer book.Close()
+        sheets:=book.GetSheetList();if len(sheets)==0{return fail(fmt.Errorf("workbook has no sheets"))}
+        rows,err:=book.Rows(sheets[0]);if err!=nil{return fail(err)};defer rows.Close()
+        var mapper rowMapper
+        for rows.Next(){vals,e:=rows.Columns();if e!=nil{return fail(e)};if mapper.headers==nil{mapper=newRowMapper(vals);continue};x:=mapper.record(vals);if isEmptyRecord(x){continue};if e=add(x);e!=nil{return fail(e)}}
+    case ".csv",".txt":
+        cr:=csv.NewReader(bufio.NewReader(f));cr.FieldsPerRecord=-1;var mapper rowMapper
+        for{vals,e:=cr.Read();if e==io.EOF{break};if e!=nil{return fail(e)};if mapper.headers==nil{mapper=newRowMapper(vals);continue};x:=mapper.record(vals);if isEmptyRecord(x){continue};if e=add(x);e!=nil{return fail(e)}}
+    default:
+        dec:=json.NewDecoder(bufio.NewReader(f));var v any;if err:=dec.Decode(&v);err!=nil{return fail(err)};for _,obj:=range toObjects(v){x:=mapObject(obj);if isEmptyRecord(x){continue};if err:=add(x);err!=nil{return fail(err)}}
+    }
+    if insert!=nil{_ = insert.Close()};if tx!=nil{if err=tx.Commit();err!=nil{return ds,count,err};tx=nil}
+    if _,err=a.db.Exec("UPDATE datasets SET rows=? WHERE id=?",count,ds);err!=nil{return ds,count,err}
+    if progress!=nil{progress(count,0)}
+    return ds,count,nil
+}
+
 
