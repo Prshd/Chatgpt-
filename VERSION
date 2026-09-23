@@ -1,7 +1,13 @@
-100
+100.1
 
 Versioning policy:
 - Initial rebuild: 100
 - Incremental updates: 100.1 through 100.9
 - Next major/minor cycle: 101, then 101.1 through 101.9, and so on.
 - Every shipped build must display and be packaged with its exact version.
+
+100.1 performance update:
+- Excel/CSV/JSON imports now use one SQLite transaction per file.
+- Prepared transaction-bound INSERT statements are used for bulk rows.
+- SQLite cache, mmap and busy-timeout tuning added.
+- Existing schema, endpoints, matching logic and import mapping are preserved.
