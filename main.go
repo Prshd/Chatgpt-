@@ -57,7 +57,7 @@ func main() {
 }
 
 func initDB(db *sql.DB) error {
-    _, err := db.Exec(`PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA temp_store=MEMORY; PRAGMA foreign_keys=ON;
+    _, err := db.Exec(`PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA temp_store=MEMORY; PRAGMA foreign_keys=ON; PRAGMA cache_size=-65536; PRAGMA mmap_size=268435456; PRAGMA busy_timeout=5000;
 CREATE TABLE IF NOT EXISTS datasets(id INTEGER PRIMARY KEY, name TEXT NOT NULL, kind TEXT NOT NULL, rows INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS transactions(id INTEGER PRIMARY KEY, dataset_id INTEGER NOT NULL, business_date TEXT, rrn TEXT, reference TEXT, amount_cents INTEGER NOT NULL DEFAULT 0, raw_json TEXT, deleted INTEGER NOT NULL DEFAULT 0, FOREIGN KEY(dataset_id) REFERENCES datasets(id));
 CREATE INDEX IF NOT EXISTS idx_tx_ds_date ON transactions(dataset_id,business_date);
@@ -92,22 +92,91 @@ func (a *App) importFile(w http.ResponseWriter,r *http.Request){
 
 func (a *App) importReader(f multipart.File, name, kind string)(int64,int64,error){
     a.heavy.Lock(); defer a.heavy.Unlock()
-    res,err:=a.db.Exec("INSERT INTO datasets(name,kind,rows,created_at) VALUES(?,?,0,?)",name,kind,time.Now().UTC().Format(time.RFC3339)); if err!=nil{return 0,0,err}; ds,err:=res.LastInsertId(); if err!=nil{return 0,0,err}
-    insert,err:=a.db.Prepare("INSERT INTO transactions(dataset_id,business_date,rrn,reference,amount_cents,raw_json) VALUES(?,?,?,?,?,?)"); if err!=nil{return ds,0,err}; defer insert.Close()
-    count:=int64(0); flush:=func(){ _=a.db.QueryRow("UPDATE datasets SET rows=? WHERE id=?",count,ds).Scan(new(any)) }
-    add:=func(x record) error { if _,e:=insert.Exec(ds,normalizeDate(x.Date),clean(x.RRN),clean(x.Ref),x.Amount,x.Raw); e!=nil{return e}; count++; if count%5000==0{flush()}; return nil }
+
+    // Keep the existing schema and import semantics, but perform the entire file
+    // import inside one SQLite transaction. The old implementation executed every
+    // INSERT as its own implicit transaction, which is extremely expensive for
+    // large Excel workbooks and becomes dramatically slower across multiple files.
+    tx,err:=a.db.Begin()
+    if err!=nil{return 0,0,err}
+    committed:=false
+    defer func(){if !committed{_ = tx.Rollback()}}()
+
+    res,err:=tx.Exec("INSERT INTO datasets(name,kind,rows,created_at) VALUES(?,?,0,?)",name,kind,time.Now().UTC().Format(time.RFC3339))
+    if err!=nil{return 0,0,err}
+    ds,err:=res.LastInsertId()
+    if err!=nil{return 0,0,err}
+
+    insert,err:=tx.Prepare("INSERT INTO transactions(dataset_id,business_date,rrn,reference,amount_cents,raw_json) VALUES(?,?,?,?,?,?)")
+    if err!=nil{return ds,0,err}
+    defer insert.Close()
+
+    count:=int64(0)
+    add:=func(x record) error {
+        if _,e:=insert.Exec(ds,normalizeDate(x.Date),clean(x.RRN),clean(x.Ref),x.Amount,x.Raw); e!=nil{return e}
+        count++
+        return nil
+    }
+
     ext:=strings.ToLower(filepath.Ext(name))
     switch ext {
     case ".xlsx", ".xlsm":
-        tmp,err:=os.CreateTemp("", "recon-*.xlsx"); if err!=nil{return ds,count,err}; tmpPath:=tmp.Name(); defer os.Remove(tmpPath); if _,err=io.Copy(tmp,f);err!=nil{tmp.Close();return ds,count,err}; tmp.Close()
-        book,err:=excelize.OpenFile(tmpPath); if err!=nil{return ds,count,err}; defer book.Close(); sheets:=book.GetSheetList(); if len(sheets)==0{return ds,count,nil}; rows,err:=book.Rows(sheets[0]); if err!=nil{return ds,count,err}; defer rows.Close();
-        var headers []string; for rows.Next(){ vals,err:=rows.Columns(); if err!=nil{return ds,count,err}; if headers==nil {headers=vals; continue}; x:=mapRow(headers,vals); if isEmptyRecord(x){continue}; if err=add(x);err!=nil{return ds,count,err} }
+        tmp,err:=os.CreateTemp("", "recon-*.xlsx")
+        if err!=nil{return ds,count,err}
+        tmpPath:=tmp.Name()
+        defer os.Remove(tmpPath)
+        if _,err=io.Copy(tmp,f);err!=nil{tmp.Close();return ds,count,err}
+        if err=tmp.Close();err!=nil{return ds,count,err}
+
+        book,err:=excelize.OpenFile(tmpPath)
+        if err!=nil{return ds,count,err}
+        defer book.Close()
+        sheets:=book.GetSheetList()
+        if len(sheets)==0{return ds,count,nil}
+        rows,err:=book.Rows(sheets[0])
+        if err!=nil{return ds,count,err}
+        defer rows.Close()
+
+        var headers []string
+        for rows.Next(){
+            vals,err:=rows.Columns()
+            if err!=nil{return ds,count,err}
+            if headers==nil {headers=vals; continue}
+            x:=mapRow(headers,vals)
+            if isEmptyRecord(x){continue}
+            if err=add(x);err!=nil{return ds,count,err}
+        }
+
     case ".csv", ".txt":
-        cr:=csv.NewReader(bufio.NewReader(f)); cr.FieldsPerRecord=-1; var headers []string; for { vals,err:=cr.Read(); if err==io.EOF{break}; if err!=nil{return ds,count,err}; if headers==nil {headers=vals; continue}; x:=mapRow(headers,vals); if isEmptyRecord(x){continue}; if err=add(x);err!=nil{return ds,count,err} }
+        cr:=csv.NewReader(bufio.NewReader(f))
+        cr.FieldsPerRecord=-1
+        var headers []string
+        for {
+            vals,err:=cr.Read()
+            if err==io.EOF{break}
+            if err!=nil{return ds,count,err}
+            if headers==nil {headers=vals; continue}
+            x:=mapRow(headers,vals)
+            if isEmptyRecord(x){continue}
+            if err=add(x);err!=nil{return ds,count,err}
+        }
+
     default:
-        dec:=json.NewDecoder(bufio.NewReader(f)); var v any; if err:=dec.Decode(&v);err!=nil{return ds,count,err}; arr:=toObjects(v); for _,obj:=range arr {x:=mapObject(obj); if isEmptyRecord(x){continue}; if err=add(x);err!=nil{return ds,count,err}}
+        dec:=json.NewDecoder(bufio.NewReader(f))
+        var v any
+        if err:=dec.Decode(&v);err!=nil{return ds,count,err}
+        arr:=toObjects(v)
+        for _,obj:=range arr {
+            x:=mapObject(obj)
+            if isEmptyRecord(x){continue}
+            if err=add(x);err!=nil{return ds,count,err}
+        }
     }
-    flush(); return ds,count,nil
+
+    if _,err=tx.Exec("UPDATE datasets SET rows=? WHERE id=?",count,ds);err!=nil{return ds,count,err}
+    if err=tx.Commit();err!=nil{return ds,count,err}
+    committed=true
+    return ds,count,nil
 }
 
 func toObjects(v any)[]map[string]any { switch x:=v.(type){case []any: out:=make([]map[string]any,0,len(x)); for _,z:=range x{if m,ok:=z.(map[string]any);ok{out=append(out,m)}}; return out; case map[string]any: for _,k:=range []string{"data","records","rows","transactions","items"}{if q,ok:=x[k];ok{return toObjects(q)}}; return []map[string]any{x}; default:return nil} }
