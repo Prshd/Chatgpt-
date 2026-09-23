@@ -31,6 +31,10 @@ jobs:
           if (!(Test-Path 'main.go')) { throw 'main.go missing' }
           if (!(Test-Path 'static/index.html')) { throw 'static/index.html missing' }
 
+      - name: Download Go dependencies
+        shell: pwsh
+        run: go mod download
+
       - name: Test
         shell: pwsh
         run: go test ./...
