@@ -19,6 +19,7 @@ import (
     "strings"
     "sync"
     "time"
+    "runtime"
 
     "github.com/xuri/excelize/v2"
     _ "modernc.org/sqlite"
@@ -27,7 +28,14 @@ import (
 //go:embed static/*
 var staticFS embed.FS
 
-type App struct { db *sql.DB; heavy sync.Mutex }
+type importJob struct {
+    ID string
+    DatasetID int64
+    Name, Kind, Status, Error string
+    Rows int64
+    StartedAt, UpdatedAt time.Time
+}
+type App struct { db *sql.DB; heavy sync.Mutex; jobs sync.Map }
 type record struct { Date, RRN, Ref string; Amount int64; Raw string }
 type rowMapper struct { headers []string; dateIdx,rrnIdx,refIdx,amountIdx int }
 
@@ -71,6 +79,7 @@ func main() {
     mux.HandleFunc("/api/health", app.health)
     mux.HandleFunc("/api/datasets", app.datasets)
     mux.HandleFunc("/api/import", app.importFile)
+    mux.HandleFunc("/api/import/status", app.importStatus)
     mux.HandleFunc("/api/clear", app.clearData)
     mux.HandleFunc("/api/pair/reconcile", app.pairReconcile)
     mux.HandleFunc("/api/pair/results", app.pairResults)
@@ -109,101 +118,85 @@ func (a *App) importFile(w http.ResponseWriter,r *http.Request){
     if err:=r.ParseMultipartForm(64<<20); err!=nil { http.Error(w,err.Error(),400); return }
     kind:=strings.ToLower(strings.TrimSpace(r.FormValue("kind"))); if kind=="" { kind="gl" }
     file,head,err:=r.FormFile("file"); if err!=nil { http.Error(w,"file required",400); return }; defer file.Close()
-    name:=head.Filename
-    id, count, err:=a.importReader(file,name,kind)
+    name:=filepath.Base(head.Filename)
+    tmp,err:=os.CreateTemp("", "smart-recon-upload-*")
     if err!=nil { http.Error(w,err.Error(),500); return }
-    writeJSON(w,map[string]any{"ok":true,"dataset_id":id,"rows":count,"name":name,"kind":kind})
+    tmpPath:=tmp.Name()
+    if _,err=io.Copy(tmp,file); err!=nil { tmp.Close(); os.Remove(tmpPath); http.Error(w,err.Error(),500); return }
+    if err=tmp.Close(); err!=nil { os.Remove(tmpPath); http.Error(w,err.Error(),500); return }
+    job:=&importJob{ID:fmt.Sprintf("%d-%d",time.Now().UnixNano(),runtime.NumGoroutine()),Name:name,Kind:kind,Status:"queued",StartedAt:time.Now(),UpdatedAt:time.Now()}
+    a.jobs.Store(job.ID,job)
+    go func(){
+        defer os.Remove(tmpPath)
+        job.Status="importing"; job.UpdatedAt=time.Now()
+        f,e:=os.Open(tmpPath)
+        if e==nil { var n int64; job.DatasetID,n,e=a.importReaderWithProgress(f,name,kind,func(rows int64){job.Rows=rows;job.UpdatedAt=time.Now()}); _=f.Close() }
+        if e!=nil { job.Status="error";job.Error=e.Error() } else { job.Status="done" }
+        job.UpdatedAt=time.Now()
+    }()
+    writeJSON(w,map[string]any{"ok":true,"job_id":job.ID,"name":name,"kind":kind})
+}
+func (a *App) importStatus(w http.ResponseWriter,r *http.Request){
+    id:=r.URL.Query().Get("job_id"); v,ok:=a.jobs.Load(id); if !ok {http.Error(w,"job not found",404);return}
+    j:=v.(*importJob); writeJSON(w,map[string]any{"ok":true,"job_id":j.ID,"dataset_id":j.DatasetID,"name":j.Name,"kind":j.Kind,"status":j.Status,"rows":j.Rows,"error":j.Error,"updated_at":j.UpdatedAt.Format(time.RFC3339Nano)})
 }
 
 func (a *App) importReader(f multipart.File, name, kind string)(int64,int64,error){
+    return a.importReaderWithProgress(f,name,kind,nil)
+}
+func (a *App) importReaderWithProgress(f io.Reader, name, kind string, progress func(int64))(int64,int64,error){
     a.heavy.Lock(); defer a.heavy.Unlock()
-
-    // Keep the existing schema and import semantics, but perform the entire file
-    // import inside one SQLite transaction. The old implementation executed every
-    // INSERT as its own implicit transaction, which is extremely expensive for
-    // large Excel workbooks and becomes dramatically slower across multiple files.
-    tx,err:=a.db.Begin()
+    res,err:=a.db.Exec("INSERT INTO datasets(name,kind,rows,created_at) VALUES(?,?,0,?)",name,kind,time.Now().UTC().Format(time.RFC3339))
     if err!=nil{return 0,0,err}
-    committed:=false
-    defer func(){if !committed{_ = tx.Rollback()}}()
-
-    res,err:=tx.Exec("INSERT INTO datasets(name,kind,rows,created_at) VALUES(?,?,0,?)",name,kind,time.Now().UTC().Format(time.RFC3339))
-    if err!=nil{return 0,0,err}
-    ds,err:=res.LastInsertId()
-    if err!=nil{return 0,0,err}
-
-    insert,err:=tx.Prepare("INSERT INTO transactions(dataset_id,business_date,rrn,reference,amount_cents,raw_json) VALUES(?,?,?,?,?,?)")
-    if err!=nil{return ds,0,err}
-    defer insert.Close()
-
-    count:=int64(0)
+    ds,err:=res.LastInsertId(); if err!=nil{return 0,0,err}
+    const batchSize int64=50000
+    var tx *sql.Tx
+    var insert *sql.Stmt
+    var count int64
+    beginBatch:=func() error {
+        var e error; tx,e=a.db.Begin(); if e!=nil{return e}
+        insert,e=tx.Prepare("INSERT INTO transactions(dataset_id,business_date,rrn,reference,amount_cents,raw_json) VALUES(?,?,?,?,?,?)")
+        if e!=nil{_ = tx.Rollback(); return e}; return nil
+    }
+    commitBatch:=func() error {
+        if insert!=nil{_ = insert.Close()}; insert=nil
+        if tx!=nil{if e:=tx.Commit();e!=nil{return e}}; tx=nil
+        _,e:=a.db.Exec("UPDATE datasets SET rows=? WHERE id=?",count,ds); return e
+    }
+    if err=beginBatch();err!=nil{return ds,count,err}
+    fail:=func(e error)(int64,int64,error){if insert!=nil{_ = insert.Close()};if tx!=nil{_ = tx.Rollback()};return ds,count,e}
     add:=func(x record) error {
-        if _,e:=insert.Exec(ds,normalizeDate(x.Date),clean(x.RRN),clean(x.Ref),x.Amount,x.Raw); e!=nil{return e}
+        if _,e:=insert.Exec(ds,normalizeDate(x.Date),clean(x.RRN),clean(x.Ref),x.Amount,x.Raw);e!=nil{return e}
         count++
+        if count%batchSize==0 {
+            if e:=commitBatch();e!=nil{return e}
+            if progress!=nil{progress(count)}
+            if e:=beginBatch();e!=nil{return e}
+        }
         return nil
     }
-
     ext:=strings.ToLower(filepath.Ext(name))
     switch ext {
-    case ".xlsx", ".xlsm":
-        tmp,err:=os.CreateTemp("", "recon-*.xlsx")
-        if err!=nil{return ds,count,err}
-        tmpPath:=tmp.Name()
-        defer os.Remove(tmpPath)
-        if _,err=io.Copy(tmp,f);err!=nil{tmp.Close();return ds,count,err}
-        if err=tmp.Close();err!=nil{return ds,count,err}
-
-        book,err:=excelize.OpenFile(tmpPath)
-        if err!=nil{return ds,count,err}
-        defer book.Close()
-        sheets:=book.GetSheetList()
-        if len(sheets)==0{return ds,count,nil}
-        rows,err:=book.Rows(sheets[0])
-        if err!=nil{return ds,count,err}
-        defer rows.Close()
-
+    case ".xlsx",".xlsm":
+        tmp,err:=os.CreateTemp("","recon-*.xlsx");if err!=nil{return fail(err)}
+        tmpPath:=tmp.Name();defer os.Remove(tmpPath)
+        if _,err=io.Copy(tmp,f);err!=nil{tmp.Close();return fail(err)};if err=tmp.Close();err!=nil{return fail(err)}
+        book,err:=excelize.OpenFile(tmpPath);if err!=nil{return fail(err)};defer book.Close()
+        sheets:=book.GetSheetList();if len(sheets)==0{return fail(fmt.Errorf("workbook has no sheets"))}
+        rows,err:=book.Rows(sheets[0]);if err!=nil{return fail(err)};defer rows.Close()
         var mapper rowMapper
-        for rows.Next(){
-            vals,err:=rows.Columns()
-            if err!=nil{return ds,count,err}
-            if mapper.headers==nil {mapper=newRowMapper(vals); continue}
-            x:=mapper.record(vals)
-            if isEmptyRecord(x){continue}
-            if err=add(x);err!=nil{return ds,count,err}
-        }
-
-    case ".csv", ".txt":
-        cr:=csv.NewReader(bufio.NewReader(f))
-        cr.FieldsPerRecord=-1
-        var mapper rowMapper
-        for {
-            vals,err:=cr.Read()
-            if err==io.EOF{break}
-            if err!=nil{return ds,count,err}
-            if mapper.headers==nil {mapper=newRowMapper(vals); continue}
-            x:=mapper.record(vals)
-            if isEmptyRecord(x){continue}
-            if err=add(x);err!=nil{return ds,count,err}
-        }
-
+        for rows.Next(){vals,e:=rows.Columns();if e!=nil{return fail(e)};if mapper.headers==nil{mapper=newRowMapper(vals);continue};x:=mapper.record(vals);if isEmptyRecord(x){continue};if e=add(x);e!=nil{return fail(e)}}
+    case ".csv",".txt":
+        cr:=csv.NewReader(bufio.NewReader(f));cr.FieldsPerRecord=-1;var mapper rowMapper
+        for {vals,e:=cr.Read();if e==io.EOF{break};if e!=nil{return fail(e)};if mapper.headers==nil{mapper=newRowMapper(vals);continue};x:=mapper.record(vals);if isEmptyRecord(x){continue};if e=add(x);e!=nil{return fail(e)}}
     default:
-        dec:=json.NewDecoder(bufio.NewReader(f))
-        var v any
-        if err:=dec.Decode(&v);err!=nil{return ds,count,err}
-        arr:=toObjects(v)
-        for _,obj:=range arr {
-            x:=mapObject(obj)
-            if isEmptyRecord(x){continue}
-            if err=add(x);err!=nil{return ds,count,err}
-        }
+        dec:=json.NewDecoder(bufio.NewReader(f));var v any;if err:=dec.Decode(&v);err!=nil{return fail(err)};for _,obj:=range toObjects(v){x:=mapObject(obj);if isEmptyRecord(x){continue};if err:=add(x);err!=nil{return fail(err)}}
     }
-
-    if _,err=tx.Exec("UPDATE datasets SET rows=? WHERE id=?",count,ds);err!=nil{return ds,count,err}
-    if err=tx.Commit();err!=nil{return ds,count,err}
-    committed=true
+    if insert!=nil{_ = insert.Close()};if tx!=nil{if err=tx.Commit();err!=nil{return ds,count,err};tx=nil}
+    if _,err=a.db.Exec("UPDATE datasets SET rows=? WHERE id=?",count,ds);err!=nil{return ds,count,err}
+    if progress!=nil{progress(count)}
     return ds,count,nil
 }
-
 func toObjects(v any)[]map[string]any { switch x:=v.(type){case []any: out:=make([]map[string]any,0,len(x)); for _,z:=range x{if m,ok:=z.(map[string]any);ok{out=append(out,m)}}; return out; case map[string]any: for _,k:=range []string{"data","records","rows","transactions","items"}{if q,ok:=x[k];ok{return toObjects(q)}}; return []map[string]any{x}; default:return nil} }
 func mapObject(m map[string]any)record{ b,_:=json.Marshal(m); return record{Date:firstMap(m,"date","business_date","transaction_date","value_date","posting_date"),RRN:firstMap(m,"rrn","retrieval_reference","retrieval_reference_number"),Ref:firstMap(m,"reference","ref","transaction_reference","external_reference"),Amount:parseAmount(firstMap(m,"amount","transaction_amount","credit","debit")),Raw:string(b)} }
 func firstMap(m map[string]any,keys ...string)string{for _,k:=range keys{for mk,v:=range m{if norm(mk)==norm(k){return fmt.Sprint(v)}}};return ""}
