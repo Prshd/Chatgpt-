@@ -247,3 +247,41 @@ func (a *App) importReaderWithProgress(f io.Reader, name, kind string, progress 
 }
 
 
+
+func toObjects(v any)[]map[string]any { switch x:=v.(type){case []any: out:=make([]map[string]any,0,len(x)); for _,z:=range x{if m,ok:=z.(map[string]any);ok{out=append(out,m)}}; return out; case map[string]any: for _,k:=range []string{"data","records","rows","transactions","items"}{if q,ok:=x[k];ok{return toObjects(q)}}; return []map[string]any{x}; default:return nil} }
+func mapObject(m map[string]any)record{ b,_:=json.Marshal(m); return record{Date:firstMap(m,"date","business_date","transaction_date","value_date","posting_date"),RRN:firstMap(m,"rrn","retrieval_reference","retrieval_reference_number"),Ref:firstMap(m,"reference","ref","transaction_reference","external_reference"),Amount:parseAmount(firstMap(m,"amount","transaction_amount","credit","debit")),Raw:string(b)} }
+func firstMap(m map[string]any,keys ...string)string{for _,k:=range keys{for mk,v:=range m{if norm(mk)==norm(k){return fmt.Sprint(v)}}};return ""}
+func norm(s string)string{s=strings.ToLower(strings.TrimSpace(s)); r:=strings.NewReplacer(" ","","_","","-","","/",""); return r.Replace(s)}
+func clean(s string)string{return strings.TrimSpace(s)}
+func normalizeDate(s string)string{s=strings.TrimSpace(s); if s==""{return ""}; for _,layout:=range []string{"2006-01-02","02/01/2006","01/02/2006","2006/01/02","02-01-2006"}{if t,e:=time.Parse(layout,s);e==nil{return t.Format("2006-01-02")}}; return s}
+func parseAmount(s string)int64{s=strings.TrimSpace(strings.ReplaceAll(strings.ReplaceAll(s,",","")," ","")); if s==""{return 0}; neg:=false; if strings.HasPrefix(s,"(")&&strings.HasSuffix(s,")"){neg=true;s=strings.Trim(s,"()")}; f,e:=strconv.ParseFloat(s,64); if e!=nil{return 0}; n:=int64(f*100+0.5); if neg{return -n}; return n}
+func isEmptyRecord(x record)bool{return x.Date==""&&x.RRN==""&&x.Ref==""&&x.Amount==0}
+
+func (a *App) clearData(w http.ResponseWriter,r *http.Request){if r.Method!="POST"{http.Error(w,"POST required",405);return}; a.heavy.Lock();defer a.heavy.Unlock(); if _,e:=a.db.Exec("DELETE FROM pair_matches; DELETE FROM pair_runs; DELETE FROM transactions; DELETE FROM datasets;");e!=nil{http.Error(w,e.Error(),500);return};writeJSON(w,map[string]any{"ok":true})}
+
+func (a *App) pairReconcile(w http.ResponseWriter,r *http.Request){
+    if r.Method!="POST"{http.Error(w,"POST required",405);return}; var req struct{Left,Right int64}; if json.NewDecoder(r.Body).Decode(&req)!=nil||req.Left<=0||req.Right<=0||req.Left==req.Right{http.Error(w,"left and right dataset ids required",400);return}
+    a.heavy.Lock(); defer a.heavy.Unlock()
+    var runID int64; err:=a.db.QueryRow("SELECT id FROM pair_runs WHERE left_dataset=? AND right_dataset=? AND status IN ('running','paused') ORDER BY id DESC LIMIT 1",req.Left,req.Right).Scan(&runID)
+    if err==sql.ErrNoRows {now:=time.Now().UTC().Format(time.RFC3339); res,e:=a.db.Exec("INSERT INTO pair_runs(left_dataset,right_dataset,status,started_at,updated_at) VALUES(?,?,?,?,?)",req.Left,req.Right,"running",now,now);if e!=nil{http.Error(w,e.Error(),500);return};runID,_=res.LastInsertId()} else if err!=nil{http.Error(w,err.Error(),500);return}
+    if err=runPairStages(a.db,runID,req.Left,req.Right);err!=nil{_,_=a.db.Exec("UPDATE pair_runs SET status='error',updated_at=? WHERE id=?",time.Now().UTC().Format(time.RFC3339),runID);http.Error(w,err.Error(),500);return}; writeJSON(w,map[string]any{"run_id":runID,"status":"done"})
+}
+
+func runPairStages(db *sql.DB,runID,left,right int64)error{
+    var start int; _=db.QueryRow("SELECT stage FROM pair_runs WHERE id=?",runID).Scan(&start); if start<1{start=0}
+    for stage:=start+1;stage<=4;stage++ { tx,e:=db.Begin();if e!=nil{return e}; key:="rrn";if stage==2||stage==4{key="reference"}; date:="";if stage<=2{date=",business_date"}
+        // Uniqueness is evaluated on key+amount (+business date for stages 1/2), and only records not already matched in this run participate.
+        q:=fmt.Sprintf(`WITH l AS (SELECT t.id,t.%s k,t.amount_cents t_amt,t.business_date d,COUNT(*) OVER(PARTITION BY t.%s,t.amount_cents%s) n FROM transactions t WHERE t.dataset_id=? AND t.deleted=0 AND t.%s<>'' AND NOT EXISTS(SELECT 1 FROM pair_matches p WHERE p.run_id=? AND p.left_id=t.id)), r AS (SELECT t.id,t.%s k,t.amount_cents t_amt,t.business_date d,COUNT(*) OVER(PARTITION BY t.%s,t.amount_cents%s) n FROM transactions t WHERE t.dataset_id=? AND t.deleted=0 AND t.%s<>'' AND NOT EXISTS(SELECT 1 FROM pair_matches p WHERE p.run_id=? AND p.right_id=t.id)) INSERT INTO pair_matches(run_id,left_id,right_id,stage) SELECT ?,l.id,r.id,? FROM l JOIN r ON l.k=r.k AND l.t_amt=r.t_amt %s WHERE l.n=1 AND r.n=1`,key,key,date,key,key,key,date,key,func()string{if stage<=2{return "AND l.d=r.d"};return ""}())
+        if _,e=tx.Exec(q,left,runID,right,runID,runID,stage);e!=nil{tx.Rollback();return e}
+        if _,e=tx.Exec("UPDATE pair_runs SET stage=?,updated_at=? WHERE id=?",stage,time.Now().UTC().Format(time.RFC3339),runID);e!=nil{tx.Rollback();return e};if e=tx.Commit();e!=nil{return e}
+    }
+    _,e:=db.Exec("UPDATE pair_runs SET status='done',stage=4,updated_at=? WHERE id=?",time.Now().UTC().Format(time.RFC3339),runID);return e
+}
+
+func (a *App) pairResults(w http.ResponseWriter,r *http.Request){runID,_:=strconv.ParseInt(r.URL.Query().Get("run_id"),10,64);limit:=500;if n,_:=strconv.Atoi(r.URL.Query().Get("limit"));n>0&&n<=2000{limit=n};off,_:=strconv.Atoi(r.URL.Query().Get("offset"));rows,e:=a.db.Query(`SELECT m.left_id,m.right_id,m.stage, l.business_date,l.rrn,l.reference,l.amount_cents,r.business_date,r.rrn,r.reference,r.amount_cents FROM pair_matches m JOIN transactions l ON l.id=m.left_id JOIN transactions r ON r.id=m.right_id WHERE m.run_id=? ORDER BY m.left_id LIMIT ? OFFSET ?`,runID,limit,off);if e!=nil{http.Error(w,e.Error(),500);return};defer rows.Close();out:=[]map[string]any{};for rows.Next(){var li,ri,st,la,ra int64;var ld,lr,lref,rd,rr,rref string;if e=rows.Scan(&li,&ri,&st,&ld,&lr,&lref,&la,&rd,&rr,&rref,&ra);e==nil{out=append(out,map[string]any{"left_id":li,"right_id":ri,"stage":st,"left":map[string]any{"date":ld,"rrn":lr,"reference":lref,"amount_cents":la},"right":map[string]any{"date":rd,"rrn":rr,"reference":rref,"amount_cents":ra}})} };writeJSON(w,map[string]any{"rows":out,"next_offset":off+len(out)})}
+
+func (a *App) outstanding(w http.ResponseWriter,r *http.Request){kind:=strings.ToLower(r.URL.Query().Get("kind"));from:=r.URL.Query().Get("from");to:=r.URL.Query().Get("to");limit:=500;off,_:=strconv.Atoi(r.URL.Query().Get("offset"));q:=`SELECT t.id,t.business_date,t.rrn,t.reference,t.amount_cents,d.name,d.kind FROM transactions t JOIN datasets d ON d.id=t.dataset_id WHERE t.deleted=0 AND d.kind=? AND NOT EXISTS(SELECT 1 FROM pair_matches p JOIN pair_runs pr ON pr.id=p.run_id AND pr.status='done' WHERE p.left_id=t.id OR p.right_id=t.id)`;args:=[]any{kind};if from!=""{q+=" AND t.business_date>=?";args=append(args,from)};if to!=""{q+=" AND t.business_date<=?";args=append(args,to)};q+=" ORDER BY t.business_date,t.id LIMIT ? OFFSET ?";args=append(args,limit,off);rows,e:=a.db.Query(q,args...);if e!=nil{http.Error(w,e.Error(),500);return};defer rows.Close();out:=[]map[string]any{};for rows.Next(){var id,amt int64;var d,dt,rr,rf,k string;if e=rows.Scan(&id,&d,&rr,&rf,&amt,&dt,&k);e==nil{out=append(out,map[string]any{"id":id,"date":d,"rrn":rr,"reference":rf,"amount_cents":amt,"dataset":dt,"kind":k})}};writeJSON(w,map[string]any{"rows":out,"next_offset":off+len(out)})}
+func (a *App) stats(w http.ResponseWriter,r *http.Request){var datasets,matches,gl,ceft,cb int64;_ = a.db.QueryRow("SELECT COUNT(*) FROM datasets").Scan(&datasets);_=a.db.QueryRow("SELECT COUNT(*) FROM pair_matches").Scan(&matches);_=a.db.QueryRow("SELECT COALESCE(SUM(rows),0) FROM datasets WHERE kind='gl'").Scan(&gl);_=a.db.QueryRow("SELECT COALESCE(SUM(rows),0) FROM datasets WHERE kind='ceft'").Scan(&ceft);_=a.db.QueryRow("SELECT COALESCE(SUM(rows),0) FROM datasets WHERE kind IN ('cash','cash_at_banker','cashatbanker')").Scan(&cb);writeJSON(w,map[string]any{"datasets":datasets,"matches":matches,"gl_rows":gl,"ceft_rows":ceft,"cash_rows":cb})}
+func writeJSON(w http.ResponseWriter,v any){w.Header().Set("Content-Type","application/json");_ = json.NewEncoder(w).Encode(v)}
+var _ = template.HTMLEscapeString
+var _ = zip.ErrFormat
