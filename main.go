@@ -170,7 +170,7 @@ func (a *App) runImportJob(j *importJob,tmpPath string){
     j.mu.Lock();j.Status="importing";j.UpdatedAt=time.Now();j.mu.Unlock()
     f,e:=os.Open(tmpPath)
     if e==nil {
-        var n int64
+        var ds,n int64
         var lastRows,lastBytes int64
         var last=time.Now()
         ds,n,e=a.importReaderWithProgress(f,j.Name,j.Kind,func(rows int64,committedBytes int64){
