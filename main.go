@@ -205,7 +205,7 @@ func (a *App) importReader(f multipart.File, name, kind string)(int64,int64,erro
 }
 
 func toObjects(v any)[]map[string]any { switch x:=v.(type){case []any: out:=make([]map[string]any,0,len(x)); for _,z:=range x{if m,ok:=z.(map[string]any);ok{out=append(out,m)}}; return out; case map[string]any: for _,k:=range []string{"data","records","rows","transactions","items"}{if q,ok:=x[k];ok{return toObjects(q)}}; return []map[string]any{x}; default:return nil} }
-func mapObject(m map[string]any)record{ b,_:=json.Marshal(m); return record{Date:firstMap(m,"date","business_date","transaction_date","value_date","posting_date"),RRN:firstMap(m,"rrn","retrieval_reference","retrieval_reference_number"),Ref:firstMap(m,"reference","ref","transaction_reference","external_reference"),Amount=parseAmount(firstMap(m,"amount","transaction_amount","credit","debit")),Raw:string(b)} }
+func mapObject(m map[string]any)record{ b,_:=json.Marshal(m); return record{Date:firstMap(m,"date","business_date","transaction_date","value_date","posting_date"),RRN:firstMap(m,"rrn","retrieval_reference","retrieval_reference_number"),Ref:firstMap(m,"reference","ref","transaction_reference","external_reference"),Amount:parseAmount(firstMap(m,"amount","transaction_amount","credit","debit")),Raw:string(b)} }
 func firstMap(m map[string]any,keys ...string)string{for _,k:=range keys{for mk,v:=range m{if norm(mk)==norm(k){return fmt.Sprint(v)}}};return ""}
 func norm(s string)string{s=strings.ToLower(strings.TrimSpace(s)); r:=strings.NewReplacer(" ","","_","","-","","/",""); return r.Replace(s)}
 func clean(s string)string{return strings.TrimSpace(s)}
