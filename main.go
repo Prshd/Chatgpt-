@@ -29,6 +29,31 @@ var staticFS embed.FS
 
 type App struct { db *sql.DB; heavy sync.Mutex }
 type record struct { Date, RRN, Ref string; Amount int64; Raw string }
+type rowMapper struct { headers []string; dateIdx,rrnIdx,refIdx,amountIdx int }
+
+func newRowMapper(headers []string) rowMapper {
+    m:=rowMapper{headers:headers,dateIdx:-1,rrnIdx:-1,refIdx:-1,amountIdx:-1}
+    for i,h:=range headers {
+        n:=norm(h)
+        switch n {
+        case "date","businessdate","transactiondate","valuedate","postingdate": if m.dateIdx<0 {m.dateIdx=i}
+        case "rrn","retrievalreference","retrievalreferencenumber": if m.rrnIdx<0 {m.rrnIdx=i}
+        case "reference","ref","transactionreference","externalreference": if m.refIdx<0 {m.refIdx=i}
+        case "amount","transactionamount","credit","debit": if m.amountIdx<0 {m.amountIdx=i}
+        }
+    }
+    return m
+}
+
+func (m rowMapper) record(vals []string) record {
+    get:=func(i int) string { if i>=0 && i<len(vals) { return vals[i] }; return "" }
+    // Keep Raw JSON compatible with the existing mapRow behaviour while avoiding
+    // the repeated header normalization/search done for every Excel row.
+    raw:=make(map[string]any,len(m.headers))
+    for i,k:=range m.headers { if i<len(vals) { raw[k]=vals[i] } }
+    b,_:=json.Marshal(raw)
+    return record{Date:get(m.dateIdx),RRN:get(m.rrnIdx),Ref:get(m.refIdx),Amount:parseAmount(get(m.amountIdx)),Raw:string(b)}
+}
 
 type importRequest struct { Kind string }
 
@@ -72,7 +97,7 @@ CREATE INDEX IF NOT EXISTS idx_pm_run_stage ON pair_matches(run_id,stage);
 }
 
 func (a *App) index(w http.ResponseWriter, r *http.Request) { b,_:=staticFS.ReadFile("static/index.html"); w.Header().Set("Content-Type","text/html; charset=utf-8"); _,_=w.Write(b) }
-func (a *App) health(w http.ResponseWriter,r *http.Request){ writeJSON(w,map[string]any{"ok":true,"sqlite":true,"version":"100"}) }
+func (a *App) health(w http.ResponseWriter,r *http.Request){ writeJSON(w,map[string]any{"ok":true,"sqlite":true,"version":"100.1"}) }
 
 func (a *App) datasets(w http.ResponseWriter,r *http.Request){
     rows,err:=a.db.Query("SELECT id,name,kind,rows,created_at FROM datasets ORDER BY id DESC"); if err!=nil{http.Error(w,err.Error(),500);return}; defer rows.Close()
@@ -137,12 +162,12 @@ func (a *App) importReader(f multipart.File, name, kind string)(int64,int64,erro
         if err!=nil{return ds,count,err}
         defer rows.Close()
 
-        var headers []string
+        var mapper rowMapper
         for rows.Next(){
             vals,err:=rows.Columns()
             if err!=nil{return ds,count,err}
-            if headers==nil {headers=vals; continue}
-            x:=mapRow(headers,vals)
+            if mapper.headers==nil {mapper=newRowMapper(vals); continue}
+            x:=mapper.record(vals)
             if isEmptyRecord(x){continue}
             if err=add(x);err!=nil{return ds,count,err}
         }
@@ -150,13 +175,13 @@ func (a *App) importReader(f multipart.File, name, kind string)(int64,int64,erro
     case ".csv", ".txt":
         cr:=csv.NewReader(bufio.NewReader(f))
         cr.FieldsPerRecord=-1
-        var headers []string
+        var mapper rowMapper
         for {
             vals,err:=cr.Read()
             if err==io.EOF{break}
             if err!=nil{return ds,count,err}
-            if headers==nil {headers=vals; continue}
-            x:=mapRow(headers,vals)
+            if mapper.headers==nil {mapper=newRowMapper(vals); continue}
+            x:=mapper.record(vals)
             if isEmptyRecord(x){continue}
             if err=add(x);err!=nil{return ds,count,err}
         }
@@ -181,7 +206,6 @@ func (a *App) importReader(f multipart.File, name, kind string)(int64,int64,erro
 
 func toObjects(v any)[]map[string]any { switch x:=v.(type){case []any: out:=make([]map[string]any,0,len(x)); for _,z:=range x{if m,ok:=z.(map[string]any);ok{out=append(out,m)}}; return out; case map[string]any: for _,k:=range []string{"data","records","rows","transactions","items"}{if q,ok:=x[k];ok{return toObjects(q)}}; return []map[string]any{x}; default:return nil} }
 func mapObject(m map[string]any)record{ b,_:=json.Marshal(m); return record{Date:firstMap(m,"date","business_date","transaction_date","value_date","posting_date"),RRN:firstMap(m,"rrn","retrieval_reference","retrieval_reference_number"),Ref:firstMap(m,"reference","ref","transaction_reference","external_reference"),Amount=parseAmount(firstMap(m,"amount","transaction_amount","credit","debit")),Raw:string(b)} }
-func mapRow(h,v []string)record{m:=map[string]any{}; for i,k:=range h{if i<len(v){m[k]=v[i]}}; return mapObject(m)}
 func firstMap(m map[string]any,keys ...string)string{for _,k:=range keys{for mk,v:=range m{if norm(mk)==norm(k){return fmt.Sprint(v)}}};return ""}
 func norm(s string)string{s=strings.ToLower(strings.TrimSpace(s)); r:=strings.NewReplacer(" ","","_","","-","","/",""); return r.Replace(s)}
 func clean(s string)string{return strings.TrimSpace(s)}
